@@ -1,0 +1,485 @@
+--- Source/FreeImage/PluginIFF.cpp	2012-02-19 11:33:18.000000000 +0900
++++ Source/FreeImage/PluginIFF.cpp	2012-03-30 16:58:36.716718959 +0900
+@@ -74,6 +74,27 @@
+ 
+ #define MAKE_ID(a, b, c, d)         ((IFF_ID)(a)<<24 | (IFF_ID)(b)<<16 | (IFF_ID)(c)<<8 | (IFF_ID)(d))
+ 
++// For maya iff support
++#define RGB_FLAG     0x01
++#define ALPHA_FLAG   0x02
++#define RGBA_FLAG    0x03 // RGB_FLAG | ALPHA_FLAG
++#define ZBUFFER_FLAG 0x04
++#define BLACK_FLAG   0x10
++#define NO_COMP      0
++#define RLE_COMP     1
++#define ID_FOR4     MAKE_ID('F', 'O', 'R', '4')
++#define ID_CIMG     MAKE_ID('C', 'I', 'M', 'G') // FOR4 subtype
++#define ID_TBHD     MAKE_ID('T', 'B', 'H', 'D')
++#define ID_TBMP     MAKE_ID('T', 'B', 'M', 'P') // FOR4 subtype
++#define ID_RGBA     MAKE_ID('R', 'G', 'B', 'A')
++#define ID_ZBUF     MAKE_ID('Z', 'B', 'U', 'F')
++#define ID_DATE     MAKE_ID('D', 'A', 'T', 'E')
++#define ID_CLPZ     MAKE_ID('C', 'L', 'P', 'Z')
++#define ID_HIST     MAKE_ID('H', 'I', 'S', 'T')
++#define ID_VERS     MAKE_ID('V', 'E', 'R', 'S')
++#define ID_ESXY     MAKE_ID('E', 'S', 'X', 'Y')
++
++
+ #define ID_FORM     MAKE_ID('F', 'O', 'R', 'M')     /* EA IFF 85 group identifier */
+ #define ID_CAT      MAKE_ID('C', 'A', 'T', ' ')     /* EA IFF 85 group identifier */
+ #define ID_LIST     MAKE_ID('L', 'I', 'S', 'T')     /* EA IFF 85 group identifier */
+@@ -166,7 +187,7 @@
+ 	SwapLong(&type);
+ #endif
+ 
+-	if(type != ID_FORM)
++	if(type != ID_FORM && type != ID_FOR4)
+ 		return FALSE;
+ 		
+ 	// skip 4 bytes
+@@ -178,8 +199,8 @@
+ 	SwapLong(&type);
+ #endif
+ 
+-	// File format : ID_PBM = Packed Bitmap, ID_ILBM = Interleaved Bitmap
+-	return (type == ID_ILBM) || (type == ID_PBM);
++	// File format : ID_PBM = Packed Bitmap, ID_ILBM = Interleaved Bitmap, ID_CIMG: Maya
++	return (type == ID_ILBM) || (type == ID_PBM) || (type == ID_CIMG);
+ }
+ 
+ 
+@@ -195,6 +216,419 @@
+ 
+ // ----------------------------------------------------------
+ 
++#if 0
++#  define IFF_VERBOSE
++#endif
++
++static FIBITMAP * DLL_CALLCONV
++LoadMayaIFF(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
++   FIBITMAP *dib = NULL;
++   DWORD type, size;
++   DWORD width = 0, height = 0, flgs = 0, compress = 0, nchan = 0;
++   WORD tiles = 0, dtype = 0, dummy = 0;
++   unsigned long eof = 0;
++   bool zbuffer = false;
++   
++   type = ID_FOR4;
++   // FOR4 tag already read, next -> read size
++   
++   io->read_proc(&size, 4, 1, handle);
++#ifndef FREEIMAGE_BIGENDIAN
++   SwapLong(&size);
++#endif
++   eof = io->tell_proc(handle) + size;
++   
++   io->read_proc(&type, 4, 1, handle);
++#ifndef FREEIMAGE_BIGENDIAN
++   SwapLong(&type);
++#endif
++   
++   if (type != ID_CIMG) {
++      return NULL;
++   }
++   
++   while ((unsigned long)io->tell_proc(handle) < eof) {
++      
++      unsigned long ch_start, ch_end, ch_pad;
++      DWORD ch_type, ch_size;
++      
++      ch_start = io->tell_proc(handle);
++      
++      io->read_proc(&ch_type, 4, 1, handle);
++      io->read_proc(&ch_size, 4, 1, handle);
++      
++#ifndef FREEIMAGE_BIGENDIAN
++      SwapLong(&ch_type);
++      SwapLong(&ch_size);
++#endif
++      
++      // figure out chunk end
++      ch_end = ch_start + (unsigned long)ch_size + 8;
++      ch_pad = ch_end % 4;
++      if (ch_pad != 0) {
++         ch_end += 4 - ch_pad;
++      }
++      
++      if (ch_type == ID_TBHD) {
++         // Header chunk found
++         io->read_proc(&width, 4, 1, handle);
++         io->read_proc(&height, 4, 1, handle);
++         // skip 2 bytes
++         io->read_proc(&dummy, 2, 1, handle);
++         // skip 2 bytes
++         io->read_proc(&dummy, 2, 1, handle);
++         // read 4 bytes -> flags
++         io->read_proc(&flgs, 4, 1, handle);
++         // read 2 bytes -> dtype (0: byte, 1: short, 3: float)
++         io->read_proc(&dtype, 2, 1, handle);
++         // read 2 bytes -> tiles
++         io->read_proc(&tiles, 2, 1, handle);
++         // read 4 bytes -> compress
++         io->read_proc(&compress, 4, 1, handle);
++         
++#ifndef FREEIMAGE_BIGENDIAN
++         SwapLong(&width);
++         SwapLong(&height);
++         SwapLong(&flgs);
++         SwapLong(&compress);
++         SwapShort(&dtype);
++         SwapShort(&tiles);
++#endif
++         
++         if (tiles == 0) {
++            fprintf(stderr, "No tiles in Maya IFF\n");
++            return NULL;
++         }
++         
++         if (compress > 1) {
++            fprintf(stderr, "Only uncompressed or RLE-compressed Maya IFF are supported\n");
++            return NULL;
++         }
++         
++         if ((flgs & RGBA_FLAG) != 0) {
++            if (dtype != 0) {
++               fprintf(stderr, "Unsupported Maya IFF RGB(A) format\n", dtype);
++               return NULL;
++            }
++            
++            if ((flgs & RGB_FLAG) != 0) {
++               nchan += 3;
++            }
++            if ((flgs & ALPHA_FLAG) != 0) {
++               nchan += 1;
++            }
++            zbuffer = false;
++            
++            if (nchan >= 3) {
++               dib = FreeImage_Allocate(width, height, nchan * 8,
++                                        FI_RGBA_RED_MASK,
++                                        FI_RGBA_GREEN_MASK,
++                                        FI_RGBA_BLUE_MASK);
++            } else {
++               dib = FreeImage_Allocate(width, height, nchan * 8);
++            }
++            
++         } else if ((flgs & ZBUFFER_FLAG) != 0) {
++            // read as if 4 channels of 8 bits and do not re-order channels
++            if (dtype != 3) {
++               fprintf(stderr, "Unsupported Maya IFF zbuffer format\n", dtype);
++               return NULL;
++            }
++            nchan = 4;
++            zbuffer = true;
++            
++            dib = FreeImage_AllocateT(FIT_FLOAT, width, height, 32);
++         }
++         
++#ifdef IFF_VERBOSE
++         fprintf(stderr, "Read THBD chunk\n");
++         fprintf(stderr, "  %dx%dx%d (%d tiles, compress: %d)\n", width, height, nchan, tiles, compress);
++#endif
++      
++      } else if (ch_type == ID_FOR4) {
++#ifdef IFF_VERBOSE
++         fprintf(stderr, "Read FOR4 chunk (%u bytes)\n", (unsigned long)ch_size);
++#endif
++         // second FOR4 chunk, will contains tile data
++         DWORD t;
++         io->read_proc(&t, 4, 1, handle);
++#ifndef FREEIMAGE_BIGENDIAN
++         SwapLong(&t);
++#endif
++         if (t == ID_TBMP) {
++            WORD x1, x2, y1, y2, revY, tw, th, ta, tile = 0;
++            bool compressed;
++            
++            unsigned char *data = 0, *rawData = 0;
++            unsigned char *channels[4] = {0, 0, 0, 0};
++            WORD dw = 0, dh = 0; // allocated tile dimension;
++            unsigned long rawDataLength = 0;
++            
++            // read all tiles
++            while (tile < tiles) {
++               // read chunk
++               unsigned long t_end, t_pad, t_start = io->tell_proc(handle);
++               DWORD t_type, t_size;
++               
++               io->read_proc(&t_type, 4, 1, handle);
++               io->read_proc(&t_size, 4, 1, handle);
++               
++#ifndef FREEIMAGE_BIGENDIAN
++               SwapLong(&t_type);
++               SwapLong(&t_size);
++#endif
++               
++               t_end = t_start + (unsigned long)t_size + 8;
++               t_pad = t_end % 4;
++               if (t_pad != 0) {
++                  t_end += 4 - t_pad;
++               }
++               
++               if ((zbuffer && t_type != ID_ZBUF) || (!zbuffer && t_type != ID_RGBA)) {
++#ifdef IFF_VERBOSE
++                  fprintf(stderr, "Skip chunk (%s expected)\n", (zbuffer ? "ZBUF" : "RGBA"));
++                  if (t_pad != 0) {
++                     fprintf(stderr, "-> Pad with %d bytes\n", 4-t_pad);
++                  }
++#endif
++                  io->seek_proc(handle, t_end, SEEK_SET);
++                  continue;
++               }
++               
++               io->read_proc(&x1, 2, 1, handle);
++               io->read_proc(&y1, 2, 1, handle);
++               io->read_proc(&x2, 2, 1, handle);
++               io->read_proc(&y2, 2, 1, handle);
++#ifndef FREEIMAGE_BIGENDIAN
++               SwapShort(&x1);
++               SwapShort(&x2);
++               SwapShort(&y1);
++               SwapShort(&y2);
++#endif
++               tw = x2 - x1 + 1;
++               th = y2 - y1 + 1;
++               ta = tw * th;
++               
++               rawDataLength = t_size - 8;
++               
++               // is this correct?
++               compressed = (rawDataLength < (ta * nchan));
++               
++#ifdef IFF_VERBOSE
++               fprintf(stderr, "  Read tile %d @ %u,%u, %ux%u (%s)\n", tile, x1, y1, tw, th, (compressed ? "compressed" : "uncompressed"));
++#endif
++               
++               // allocate tile data if necessary
++               if (tw != dw || th != dh) {
++                  // tile data
++                  if (data) {
++                     free(data);
++                  }
++                  data = (unsigned char*) malloc(ta * nchan);
++                  // channel data for RLE tiles
++                  if (compressed) {
++                     for (DWORD c=0; c<nchan; ++c) {
++                        if (channels[c] != 0) {
++                           free(channels[c]);
++                        }
++                        channels[c] = (unsigned char*) malloc(ta);
++                     }
++                  }
++               } else {
++                  // previous tile can be of the same dimension
++                  // but still compressed may change
++                  if (compressed) {
++                     for (DWORD c=0; c<nchan; ++c) {
++                        if (channels[c] == 0) {
++                           channels[c] = (unsigned char*) malloc(ta);
++                        }
++                     }
++                  }
++               }
++               
++               dw = tw;
++               dh = th;
++               
++               if (compressed) {
++                  
++                  unsigned long offset = 0; 
++                  unsigned char next;
++                  unsigned int numbytes = ta;
++                  unsigned int bytecount = 0;
++                  unsigned int count = 0;
++                  unsigned char *channel = 0;
++                  
++                  rawData = (unsigned char*) malloc(rawDataLength);
++                  io->read_proc(rawData, rawDataLength, 1, handle);
++                  
++                  // decompress each channel separately
++                  for (int i=(nchan-1); i>=0; --i) {
++                     
++                     channel = channels[i];
++                     bytecount = 0;
++                     count = 0;
++                     
++                     // reset channel
++                     memset(channel, 0, ta);
++                     
++                     while (bytecount < numbytes) {
++                        if (offset >= rawDataLength) {
++                           break;
++                        }
++                        next = rawData[offset];
++                        ++offset;
++                        count = (next & 0x7F) + 1;
++                        if ((bytecount + count) > numbytes) {
++                           break;
++                        }
++                        if ((next & 0x80) != 0) {
++                           // duplication run
++                           next = rawData[offset];
++                           ++offset;
++                           for (unsigned int r=0; r<count; ++r) {
++                              channel[bytecount] = next;
++                              ++bytecount;
++                           }
++                        } else {
++                           // verbatim run
++                           for (unsigned int r=0; r<count; ++r) {
++                              channel[bytecount] = rawData[offset];
++                              ++offset;
++                              ++bytecount;
++                           }
++                        }
++                     }
++                  }
++                  
++                  // recombine channels (channels appear in RGBA order)
++                  // flip verically
++                  for (int row=0; row<th; ++row) {
++                     int i = (th - row - 1) * tw;
++                     int j = row * tw * nchan;
++                     for (int col=0; col<tw; ++col) {
++                        for (DWORD k=0; k<nchan; ++k) {
++                           data[j] = channels[k][i];
++                           ++j;
++                        }
++                        ++i;
++                     }
++                  }
++                  
++                  free(rawData);
++                  rawData = 0;
++                  
++               } else {
++                  // Uncompressed RGBA pixels are store as ABGR
++                  unsigned char pixel[4];
++                  int index;
++                  
++                  // flip tile vertically
++                  // flip channels for bitmaps (ABGR -> RGBA)
++                  
++                  if (zbuffer) {
++                     for (int i=(th-1); i>=0; --i) {
++                        index = i * tw * nchan;
++                        for (int j=0; j<tw; ++j) {
++                           io->read_proc(pixel, nchan, 1, handle);
++                           for (int d=0; d<nchan; ++d) {
++                              data[index] = pixel[d];
++                              ++index;
++                           }
++                        }
++                     }
++                  } else {
++                     for (int i=(th-1); i>=0; --i) {
++                        index = i * tw * nchan;
++                        for (int j=0; j<tw; ++j) {
++                           io->read_proc(pixel, nchan, 1, handle);
++                           for (int d=(nchan-1); d>=0; --d) {
++                              data[index] = pixel[d];
++                              ++index;
++                           }
++                        }
++                     }
++                  }
++               }
++               
++               if (data) {
++                  revY = y1 + th - 1;
++                  if (zbuffer) {
++                     float *fdata = (float*)data;
++                     for (int i=0, p=0; i<th; ++i) {
++                        float *scanl = (float*) FreeImage_GetScanLine(dib, revY - i);
++                        scanl += x1;
++                        for (int j=0; j<tw; ++j, ++fdata) {
++                           scanl[j] = *fdata;
++                        }
++                     }
++                     
++                  } else {
++                     for (int i=0, p=0; i<th; ++i) {
++                        BYTE *scanl = FreeImage_GetScanLine(dib, revY - i);
++                        scanl += (x1 * nchan);
++                        for (int j=0; j<tw; ++j) {
++                           for (DWORD d=0; d<nchan; ++d, ++p) {
++                              scanl[d] = data[p];
++                           }
++                           if (nchan >= 3) {
++                              // swap R/B as FreeImage bitmap expects BGRA data
++                              BYTE tmp = scanl[0];
++                              scanl[0] = scanl[2];
++                              scanl[2] = tmp;
++                           }
++                           scanl += nchan;
++                        }
++                     }
++                  }
++               }
++               
++               ++tile;
++               
++#ifdef IFF_VERBOSE
++               if (t_pad != 0) {
++                  fprintf(stderr, "  Pad with %d bytes\n", 4-t_pad);
++               }
++#endif
++               io->seek_proc(handle, t_end, SEEK_SET);
++            }
++            
++            // cleanup
++            if (data) {
++               free(data);
++            }
++            for (DWORD c=0; c<nchan; ++c) {
++               if (channels[c]) {
++                  free(channels[c]);
++               }
++            }
++         }
++      
++      } else {
++         // CLPZ -> znear, zfar [32 bit float]
++         // ESXY -> zesx, zesy  [32 bit float] (eye x/y ratio -> normalized coords -> eye coordinates)
++#ifdef IFF_VERBOSE
++         char *id = (char*)&ch_type;
++#ifndef FREEIMAGE_BIGENDIAN
++         fprintf(stderr, "Read %c%c%c%c chunk (%u bytes)\n", id[3], id[2], id[1], id[0], (unsigned long)ch_size);
++#else
++         fprintf(stderr, "Read %c%c%c%c chunk (%u bytes)\n", id[0], id[1], id[2], id[3], (unsigned long)ch_size);
++#endif
++#endif
++      }
++      
++      // Jump to next chunk (include padding)
++      
++#ifdef IFF_VERBOSE
++      if (ch_pad != 0) {
++         fprintf(stderr, "  Pad with %d bytes\n", (4 - ch_pad));
++      }
++#endif
++      io->seek_proc(handle, ch_end - io->tell_proc(handle), SEEK_CUR);
++   }
++   
++   return dib;
++}
++
+ static FIBITMAP * DLL_CALLCONV
+ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
+ 	if (handle != NULL) {
+@@ -207,8 +641,12 @@
+ 		SwapLong(&type);
+ #endif
+ 
+-		if(type != ID_FORM)
+-			return NULL;
++      if(type != ID_FORM) {
++         if( type == ID_FOR4) {
++            return LoadMayaIFF(io, handle, page, flags, data);
++         }
++         return NULL;
++      }
+ 
+ 		io->read_proc(&size, 4, 1, handle);
+ #ifndef FREEIMAGE_BIGENDIAN
