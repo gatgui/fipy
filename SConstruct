@@ -24,10 +24,11 @@ import glob
 
 prjs = [
    {"name": "fipy",
+    "prefix": python.Version(),
     "type": "dynamicmodule",
     "ext": python.ModuleExtension(),
     "srcs": glob.glob("src/*.cpp"),
-    "custom": [python.Require, freeimage.Require]}
+    "custom": [python.SoftRequire, freeimage.Require]}
 ]
 
 env = excons.MakeBaseEnv()
